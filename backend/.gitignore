@@ -1,0 +1,13 @@
+__pycache__/
+.pytest_cache/
+*.pyc
+.venv/
+data/raw/*
+data/processed/*
+data/*.sqlite3*
+models/*.joblib
+
+.env
+.env.local
+.env.production
+!*.env.production.example

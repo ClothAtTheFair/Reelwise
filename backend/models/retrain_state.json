@@ -1,0 +1,8 @@
+{
+  "fingerprint": "f9cf1c37d308a88924a4bec633b836389a05802e3521f9349b82d545ccbcdf6b",
+  "rating_count_at_start": 17,
+  "completed_at_utc": "2026-11-12T22:13:03.648540+00:00",
+  "model_path": "/home/branchleaf/Clemson/Reelwise_FastAPI_Integrated/Reelwise_integrated/backend/models/hybrid.joblib",
+  "factors": 40,
+  "seed": 42
+}
