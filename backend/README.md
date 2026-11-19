@@ -412,3 +412,20 @@ The automatically generated documentation is at
 ## Automated batch retraining
 
 Run `python batch_retrain.py --daemon --interval-hours 24` alongside FastAPI, or schedule `python batch_retrain.py --once` daily using Windows Task Scheduler or cron. Training is skipped when no app ratings changed. Completed models replace `models/hybrid.joblib` atomically and the API auto-reloads on its next request. See the project root README for setup and failure recovery.
+
+
+## Online ridge SVD fold-in (Reelwise production ranking)
+
+`HybridRecommender.fold_in_user(history)` estimates a fresh user vector against
+`svd.components_.T` with regularized least squares, using a mean-centered user
+rating vector. No full SVD refitting is performed. The FastAPI
+`GET /recommendations` endpoint opts into this with `use_fold_in=True`. At
+least five MovieLens-linked movies with training interactions are required.
+New-user confidence weights are 25% at 5–9 observations, 50% at 10–19, and
+90% at 20+. Untrained movies use Top-K/TF-IDF content fallback. Trained and
+up-to-date app users retain their original SVD factor. All fold-in constants
+are preliminary and should be evaluated with cold-start experiments.
+
+Batch retraining via `train.py` or `batch_retrain.py` is **optional**, needed
+only to update shared item factors, not to reflect new/changed app ratings.
+Existing trusted `.joblib` models are compatible with the new inference method.

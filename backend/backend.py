@@ -535,7 +535,7 @@ def recommendations(top_n: int = Query(10, ge=1, le=100), user_id: int = Depends
     try:
         results = model.recommend(
             user_id=training_uid, additional_ratings=ratings, top_n=top_n,
-            preferred_genres=genres
+            preferred_genres=genres, use_fold_in=True
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -554,7 +554,11 @@ def recommendations(top_n: int = Query(10, ge=1, le=100), user_id: int = Depends
             'top_k': model.TOP_K,
             'popularity_weight': model.NEW_USER_POPULARITY_WEIGHT,
             'collaborative_weight_if_trained': model.ESTABLISHED_COLLABORATIVE_WEIGHT,
-            'genre_weight_if_selected': model.GENRE_WEIGHT if genres else 0.0,
+            'fold_in_enabled': True,
+            'fold_in_min_ratings': model.FOLD_IN_MIN_RATINGS,
+            'fold_in_regularization': model.FOLD_IN_REGULARIZATION,
+            'genre_weight_if_selected': model.genre_preference_weight(len(ratings)) if genres else 0.0,
+            'genre_match_max_fraction': model.MAX_PREFERRED_GENRE_FRACTION if genres else None,
         },
         'items': [{**movie_details(model, model.id_to_col[r['tmdb_id']]),
                    'score': r['score'], 'collaborative_weight': r['collaborative_weight'],

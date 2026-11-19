@@ -227,16 +227,93 @@ class HybridRecommender:
             'hybrid': np.clip(hybrid, 0.5, 5.0),
         }, history, alpha
 
+    # Fold-in uses the fitted SVD item basis, not a retrained decomposition.
+    # With few ratings, a ridge fit can be noisy; the ranker uses a conservative
+    # collaborative blend and falls back to Top-K for insufficient support.
+    FOLD_IN_MIN_RATINGS = 5
+    FOLD_IN_REGULARIZATION = 1.0
+
+    def fold_in_user(self, history, *, min_ratings=None, regularization=None):
+        """Estimate a new/current user's SVD coordinates using ridge regression.
+
+        R = U @ V.T was fitted to each training user's *mean-centered* ratings.
+        Solve (Q.T Q + lambda I) u = Q.T (r - mean(r)), where Q consists of
+        rows from the frozen SVD.components_.T corresponding to rated movies.
+        Movies without an observed collaborative factor (item_counts == 0) are
+        excluded. No MovieLens IDs need to be assigned to new Reelwise users.
+
+        The ridge multiplier is relative to the average diagonal of Q.T Q:
+        absolute ridge penalties are poorly scaled for sparse SVD bases.
+        Returns None if there isn't enough collaborative evidence.
+        """
+        min_ratings = (self.FOLD_IN_MIN_RATINGS if min_ratings is None
+                       else int(min_ratings))
+        regularization = (self.FOLD_IN_REGULARIZATION if regularization is None
+                          else float(regularization))
+        if min_ratings < 1 or not np.isfinite(regularization) or regularization <= 0:
+            raise ValueError('Invalid fold-in minimum ratings or regularization')
+        if self.item_factors is None:
+            return None
+        observations = []
+        for movie_id, rating in history.items():
+            col = self.id_to_col.get(int(movie_id))
+            if col is not None and self.item_counts[col] > 0:
+                rating = float(rating)
+                if not np.isfinite(rating) or not 0.5 <= rating <= 5.0:
+                    raise ValueError('Ratings must be finite and between 0.5 and 5')
+                observations.append((col, rating))
+        if len(observations) < min_ratings:
+            return None
+        indices = np.array([col for col, _ in observations], dtype=np.intp)
+        ratings = np.array([rating for _, rating in observations], dtype=np.float64)
+        mean = float(np.mean(ratings))
+        Q = np.asarray(self.item_factors[indices], dtype=np.float64)
+        k = Q.shape[1]
+        if k == 0 or not np.any(Q):
+            return None
+        gram = Q.T @ Q
+        # Scale-invariant ridge: the regularizer adjusts to the norm of the
+        # observed item factors. This avoids over-shrinking high-dimensional
+        # catalog bases just because their per-movie factor norms are small.
+        ridge_scale = float(np.trace(gram)) / k
+        if ridge_scale <= 0 or not np.isfinite(ridge_scale):
+            return None
+        lhs = gram + (regularization * ridge_scale) * np.eye(k)
+        rhs = Q.T @ (ratings - mean)
+        factors = np.linalg.solve(lhs, rhs)
+        if not np.all(np.isfinite(factors)):
+            return None
+        return {'factors': factors, 'mean': mean, 'support': len(observations)}
+
+    @staticmethod
+    def _fold_in_weight(support):
+        """Conservative starting weights; tune via cold-start holdouts."""
+        if support < 5:
+            return 0.0
+        if support < 10:
+            return 0.25
+        if support < 20:
+            return 0.50
+        return 0.90
+
     # Production *ranking* configuration. These are experiment-selected starting
     # points, not calibrated star-rating predictors. Tests/evaluate.py continue
     # to use the original score_components() without modification.
     TOP_K = 10
     NEW_USER_POPULARITY_WEIGHT = 0.50
     ESTABLISHED_COLLABORATIVE_WEIGHT = 0.90
-    GENRE_WEIGHT = 0.25
+    # Explicit onboarding choices are a weak prior, not a genre filter.
+    # As observed ratings grow, implicit preferences should take precedence.
+    GENRE_WEIGHT = 0.08
+    GENRE_DECAY_RATINGS = 5.0
+    MAX_PREFERRED_GENRE_FRACTION = 0.60
+
+    def genre_preference_weight(self, rating_count):
+        """Smoothly diminish the influence of stated genres with evidence."""
+        return self.GENRE_WEIGHT / (1.0 + max(0, rating_count) / self.GENRE_DECAY_RATINGS)
 
     def _ranking_scores(self, user_id=None, additional_ratings=None,
-                        movie_id_type='tmdb'):
+                        movie_id_type='tmdb', use_fold_in=False):
         """Frontend ranking: trained users 90/10, newcomers Top-K/popularity.
 
         For a trained user, movies with zero collaborative interactions use
@@ -269,6 +346,20 @@ class HybridRecommender:
             scores = (alpha * components['collaborative']
                       + (1.0 - alpha) * content_rank)
             strategy = 'collaborative_topk_hybrid'
+        elif use_fold_in:
+            folded = self.fold_in_user(history)
+            if folded is not None:
+                weight = self._fold_in_weight(folded['support'])
+                alpha[self.item_counts > 0] = weight
+                collaborative = np.clip(
+                    folded['mean'] + self.item_factors @ folded['factors'],
+                    0.5, 5.0
+                )
+                scores = alpha * collaborative + (1.0 - alpha) * content_rank
+                strategy = 'fold_in_topk_hybrid'
+            else:
+                scores = content_rank
+                strategy = 'topk_popularity' if positive else 'popularity'
         else:
             scores = content_rank
             strategy = 'topk_popularity' if positive else 'popularity'
@@ -304,10 +395,12 @@ class HybridRecommender:
                 scores[i] = len(tokens & selected) / len(tokens)
         return scores
 
-    def _add_genre_preferences(self, scores, preferred_genres, genre_weight=0.25):
+    def _add_genre_preferences(self, scores, preferred_genres, genre_weight=None):
         """Blend genre affinity with a 0.5..5 existing hybrid score."""
         matches = self._genre_matches(preferred_genres)
-        if not preferred_genres:
+        if genre_weight is None:
+            genre_weight = self.GENRE_WEIGHT
+        if not preferred_genres or genre_weight <= 0:
             return scores, matches
         # Both components share the same [0,1] range before blending.
         blended = (1 - genre_weight) * ((scores - 0.5) / 4.5) + genre_weight * matches
@@ -325,15 +418,57 @@ class HybridRecommender:
             scores, _ = self._add_genre_preferences(scores, preferred_genres)
         return float(scores[self.id_to_col[mid]])
 
+    def _diversified_top_indices(self, scores, genre_matches, k, enforce_cap):
+        """Rank by model score, capping selected-genre saturation when possible.
+
+        This is a presentation-time diversity guard, NOT a genre exclusion:
+        recommendations outside the preferred genres must still score well.
+        With insufficient other-genre candidates, backfill the remaining slots.
+        """
+        available = np.flatnonzero(np.isfinite(scores))
+        if not enforce_cap:
+            chosen = available[np.argpartition(-scores[available], k - 1)[:k]]
+            return chosen[np.argsort(-scores[chosen], kind='stable')]
+
+        def top_in_group(indices):
+            if not len(indices):
+                return np.empty(0, dtype=np.int64)
+            size = min(k, len(indices))
+            best = indices[np.argpartition(-scores[indices], size - 1)[:size]]
+            return best[np.argsort(-scores[best], kind='stable')]
+
+        preferred = top_in_group(available[genre_matches[available] > 0])
+        other = top_in_group(available[genre_matches[available] <= 0])
+        cap = max(1, int(np.ceil(k * self.MAX_PREFERRED_GENRE_FRACTION)))
+        selected = []
+        pi = oi = preferred_count = 0
+        while len(selected) < k:
+            can_prefer = pi < len(preferred) and (preferred_count < cap or oi >= len(other))
+            can_other = oi < len(other)
+            if can_prefer and (not can_other or scores[preferred[pi]] >= scores[other[oi]]):
+                selected.append(preferred[pi])
+                pi += 1
+                preferred_count += 1
+            elif can_other:
+                selected.append(other[oi])
+                oi += 1
+            elif pi < len(preferred):
+                selected.append(preferred[pi])
+                pi += 1
+            else:
+                break
+        return np.asarray(selected, dtype=np.int64)
+
     def recommend(self, user_id=None, additional_ratings=None, top_n=10,
-                  movie_id_type='tmdb', preferred_genres=None):
+                  movie_id_type='tmdb', preferred_genres=None, use_fold_in=False):
         if top_n < 1:
             return []
         scores, history, alpha, strategy = self._ranking_scores(
-            user_id, additional_ratings, movie_id_type
+            user_id, additional_ratings, movie_id_type, use_fold_in=use_fold_in
         )
         scores, genre_matches = self._add_genre_preferences(
-            scores, preferred_genres, genre_weight=self.GENRE_WEIGHT
+            scores, preferred_genres,
+            genre_weight=self.genre_preference_weight(len(history))
         )
         for mid in history:
             if mid in self.id_to_col:
@@ -341,8 +476,10 @@ class HybridRecommender:
         k = min(top_n, int(np.isfinite(scores).sum()))
         if k == 0:
             return []
-        candidates = np.argpartition(-scores, k - 1)[:k]
-        order = candidates[np.argsort(-scores[candidates], kind='stable')]
+        order = self._diversified_top_indices(
+            scores, genre_matches, k,
+            enforce_cap=bool(preferred_genres),
+        )
         result = []
         for i in order:
             movie = self.movies.iloc[int(i)]

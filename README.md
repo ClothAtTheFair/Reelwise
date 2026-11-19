@@ -1,3 +1,6 @@
+> **AWS EC2 deployment:** See [DEPLOY_EC2.md](DEPLOY_EC2.md) for secure cookies,
+> rate limiting, TLS, Nginx, systemd, backups, and production setup.
+
 # Reelwise — React frontend + FastAPI recommendation backend
 
 This project merges the supplied Reelwise React/Vite design with the latest hybrid movie recommendation engine. It uses TMDB metadata + MovieLens ratings and keeps training separate from API serving.
@@ -45,41 +48,56 @@ Open `http://localhost:8443` on the development PC, or `http://YOUR-LAN-IP:8443`
 **Connectivity check from your phone:** open `http://YOUR-LAN-IP:8443/api/health`; you should see JSON containing `model_ready`. If not, verify Vite and FastAPI are running and Windows Firewall allows inbound port **8443** on your private network. The proxy is for Vite dev mode; production hosting requires an equivalent reverse proxy for `/api`. Do not expose the development server to the public internet.
 
 
-## 4. Automatic periodic collaborative retraining
+## 4. Online collaborative fold-in (no retraining after ratings)
 
-Ratings continue to personalize Top-K recommendations **immediately**. The SVD model is refreshed in the background by a **separate retraining process**, never inside an API request.
+**Fold-in is enabled for Reelwise API recommendations.** On every `/recommendations`
+request the backend uses the user's current SQLite ratings and the trained, frozen
+SVD movie factors. If at least **5** rated movies have MovieLens collaborative
+factors, it solves a small regularized least-squares system to estimate the user's
+latent vector in memory. It does **not** re-fit SVD, write a new `.joblib`, or
+require the original 25-million-rating dataset to be on the server.
 
-From a **third terminal**, run this on the development machine:
+- **0–4 linked ratings:** original Top-K TF-IDF + popularity ranking.
+- **5–9 linked ratings:** 25% fold-in collaborative / 75% Top-K + popularity.
+- **10–19 linked ratings:** 50% fold-in collaborative / 50% Top-K + popularity.
+- **20+ linked ratings:** 90% fold-in collaborative / 10% Top-K + popularity.
+- **Users with a current trained SVD factor:** original 90/10 hybrid remains in use.
+- **Movies with no collaborative interactions:** content/popularity fallback only.
+- **TMDB-only ratings:** influence Top-K immediately but do not count toward the
+  minimum of five linked collaborative observations.
 
-```bash
-cd backend
-python batch_retrain.py --daemon --interval-hours 24
-```
+These fold-in confidence weights and the default ridge multiplier (1.0, normalized
+by the item-factor Gram-matrix scale) are **conservative starting choices**, not
+validated optimal values. Evaluate cold-start NDCG@10 before changing or claiming
+an improvement in ranking quality. `score_components()` and the standalone
+holdout evaluator retain their earlier definitions for comparison.
 
-The process checks immediately on start and every 24 hours while it is running. It trains only when saved app ratings have changed since its last successful run, and skips when there are no app ratings. **Keep this terminal/process running** for recurring retraining. On the first run with existing app ratings, it trains immediately; with ~25 million MovieLens ratings, this can take substantial time and memory. Stop with Ctrl+C (after an in-progress training process finishes).
+### Optional offline full retraining
 
-**Recommended for Windows when you don't want a terminal left open:** use Windows Task Scheduler to create a daily task. Set *Program/script* to the absolute path of your Python executable (run `python -c "import sys; print(sys.executable)"`), *Add arguments* to the absolute path of `backend/batch_retrain.py` followed by `--once`, and *Start in* to the absolute `backend` directory. Alternatively, from a terminal manually run:
+The existing `batch_retrain.py` remains available if you later want to refresh
+the **movie** latent factors from new population-wide interactions or updated
+catalog data. **Do not enable the daemon or EC2 timer just to incorporate a new
+user's ratings.** Fold-in already handles them on demand. A full retrain is still
+useful occasionally, but consumes much more CPU/RAM and requires the large
+MovieLens training CSVs. Example manual command:
 
 ```bash
 cd backend
 python batch_retrain.py --once
 ```
 
-Optional: `--force` performs training even when the app-rating snapshot has not changed (e.g. following a manual change of base data). `--factors 40` and `--seed 42` preserve the original training settings; `--app-db`, `--data`, and `--model` can override paths. For periodic runs, supply the **same** database and model paths FastAPI uses.
-
-The retrainer writes a temporary `.joblib` in the models directory. **Only after successful training** does it atomically replace `models/hybrid.joblib`; on failure the existing model remains usable. FastAPI notices the changed file and reloads on its next model request (a long-running request may still use its previous in-memory model). The retrainer records successful progress in `models/retrain_state.json` and prevents overlapping runs with `models/hybrid.joblib.retrain.lock`. If the process crashes and leaves that lock behind, confirm no retraining process is running before removing it manually. Keep the model directory writable; train/load only trusted model files.
-
-**Note:** App ratings on TMDB-only movies affect Top-K immediately but cannot be mapped into the current MovieLens-ID SVD training. The batch pipeline still snapshots all app ratings so its staleness detection is accurate.
+If you retrain, the script creates a temporary model, atomically replaces the
+trusted trained model after success, and FastAPI reloads it when the file changes.
 
 ## Features connected
 
-- Register with username/password; sign in again with saved credentials. Passwords are PBKDF2-HMAC-SHA256 hashed with a random salt; bearer tokens are stored in the browser **sessionStorage** (prototype only) and rotated on login/logout.
+- Register with username/password; sign in again with saved credentials. Passwords are PBKDF2-HMAC-SHA256 hashed with a random salt; the browser uses HttpOnly cookie sessions with CSRF protection. Bearer tokens remain available for test/client compatibility.
 - Genre onboarding/preferences (`GET /genres`, `GET/PUT /users/me/genres`).
 - Search the trained TMDB catalog and open movie details with plot summary/poster.
 - Save/update a 1–5-star rating (`PUT /ratings`), see rated movies under Watched; saving a rating removes a movie from Want to watch.
 - Persist Want to watch via `GET/POST/DELETE /watchlist`.
 - Get up to 100 ranked recommendations, show 10 at a time, and browse next results with Reroll. This **pages the ranked list**; it doesn't refit or randomize the trained model. Random movie selects from the current 100 recommendation candidates.
-- Live recommendation scoring retains the backend's Top-K (K=10), 50/50 similarity–popularity new-user ranking, established-user 90/10 collaborative/content ranking, and explicit genre adjustment.
+- Live ranking uses Top-K (K=10), a 50/50 similarity–popularity content score, user-factor fold-in after five linked ratings, 90/10 for existing trained users, and explicit genre adjustment.
 
 ## API additions made for Reelwise
 
@@ -107,9 +125,9 @@ The backend's test suite uses a synthetic fitted recommender and a temporary SQL
 
 - The provided frontend originally had **mock friends' activity and profiles**, so their navigation has been hidden rather than presenting fictional data as real. Social APIs have not been implemented.
 - Watched is defined as **rated** for now. There is no separate unrated-watched status.
-- Forgot-password and recovery are not available. Don't use this prototype authentication for a public launch without additional security controls (rate limits, HTTPS, recovery, more robust session management).
+- Forgot-password and recovery are not available. Use HTTPS, the included production protections, and controlled test-user invitations; this is not a security-audited public service.
 - Vite's original Figma-specific config remains in place to preserve the supplied layout.
 - Movie catalog and model must be present for catalog/search/recommendation endpoints. User register/login and genre choices can work without a fitted model.
 - Existing/legacy bearer-token accounts have no password; new users should use `/auth/register`.
 - Images are requested from TMDB CDN; ensure poster use complies with TMDB attribution/terms.
-- Collaborative factors for app users update after running `batch_retrain.py` (daily daemon or OS-scheduled `--once`). Content-based ratings take effect immediately. FastAPI automatically reloads the replaced model on its next request.
+- Current app ratings update fold-in collaborative predictions **immediately**, with no full retraining. Optional batch retraining refreshes the frozen movie factors.
